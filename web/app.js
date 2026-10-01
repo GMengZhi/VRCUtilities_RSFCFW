@@ -15,6 +15,7 @@ const onlyLocation = el('only-location');
 let sinceId = 0;               // 事件增量游标
 let sessionState = 'offline';
 let currentSessionId = null;   // 服务端确认已登录时的账号 ID
+let isLoggedIn = false;        // 由 renderSession 更新，决定轮询间隔
 
 /* ------------------------------------------------------------------ */
 /* 令牌 */
@@ -103,6 +104,7 @@ const lastLocation = new Map();
 function renderSession(s) {
   sessionState = s.pipeline_state;
   currentSessionId = s.account_id || s.id || s.user_id || null;
+  isLoggedIn = !!currentSessionId;
   const dot = el('conn-dot');
   dot.className = 'dot ' + s.pipeline_state;
   const map = {
@@ -403,23 +405,20 @@ function isLocationEvent(t) {
 
 async function tick() {
   try {
-    // 第一步只问"谁登录了"和"要不要输验证码"。
-    // 未登录时绝不请求 friends / events —— 那些数据本来就不存在，
-    // 请求它们只会制造无意义的流量，也会让你误以为后台在空跑。
-    const [session, pending] = await Promise.all([
-      api('/api/session'),
-      api('/api/pending').catch(() => ({ awaiting_2fa: false, cooldown_secs: 0 })),
-    ]);
+    // 只用一个请求问状态。
+    // 早先这里同时打 /api/session 和 /api/pending，两者都要读 DO 快照，
+    // 等于同一份数据取两遍。现在 2FA 与冷却字段并进了 /api/session。
+    const session = await api('/api/session');
 
     const loggedIn = !!(session.account_id || session.id || session.user_id);
     renderSession(session);
 
     // 没有账号就显示登录表单；有账号但 cookie 还没建立则停在验证码那一步
-    showLogin(!loggedIn, !!pending.awaiting_2fa, pending.username);
+    showLogin(!loggedIn, !!session.awaiting_2fa, session.pending_username);
 
     // 刷新页面后恢复限流倒计时（冷却状态存在服务端）
-    if (pending.cooldown_secs > 0 && !cooldownTimer) {
-      startCooldown(pending.cooldown_secs, '');
+    if (session.cooldown_secs > 0 && !cooldownTimer) {
+      startCooldown(session.cooldown_secs, '');
     }
 
     if (!loggedIn) {
@@ -474,7 +473,10 @@ let tickTimer = null;
 let tickFailures = 0;
 
 async function loop() {
-  const fast = !!currentSessionId && !cooldownTimer;
+  // 只有"已登录且没有冷却倒计时"才需要高频轮询去追实时数据。
+  // 其余状态（未登录、等验证码、限流冷却）下服务端数据只在用户操作后
+  // 才会变，慢轮询足以发现变化，也省掉无意义的请求。
+  const fast = isLoggedIn && !cooldownTimer;
   try {
     await tick();
     tickFailures = 0;
