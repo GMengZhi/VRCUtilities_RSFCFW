@@ -24,7 +24,7 @@ use worker::*;
 use crate::db::{now_ms, params, to_json};
 use crate::event::{self as evmod, Event};
 use crate::store;
-use crate::vrchat::{LoginOutcome, VrcClient};
+use crate::vrchat::{LoginFailure, LoginOutcome, VerifyFailure, VrcClient};
 
 /// alarm 周期：2 分钟。足够在 15 分钟窗口内多次续期，也不至于太费额度。
 const ALARM_PERIOD_MS: i64 = 120_000;
@@ -33,6 +33,10 @@ const STALE_AFTER_MS: i64 = 300_000;
 
 const K_COOKIE: &str = "auth_cookie";
 const K_PENDING: &str = "pending_cookie";
+/// 登录时 VRChat 声明的 2FA 方式（`totp` / `emailOtp`），决定验证走哪个端点。
+const K_2FA_METHODS: &str = "twofa_methods";
+/// 被限流后的冷却截止时间（毫秒）。存在这里，刷新页面也能看到剩余等待时间。
+const K_COOLDOWN_UNTIL: &str = "cooldown_until";
 const K_USER_ID: &str = "user_id";
 const K_LAST_EVENT: &str = "last_event_at";
 const K_LAST_ERROR: &str = "last_error";
@@ -45,6 +49,20 @@ pub struct SessionSnapshot {
     pub last_event_at: Option<i64>,
     pub last_error: Option<String>,
     pub reconnect_count: i64,
+    /// 存在"待验证的 2FA 会话"时为 true。
+    pub awaiting_2fa: bool,
+    /// 被限流时的冷却截止时间（毫秒时间戳）。刷新页面也能据此显示倒计时。
+    pub cooldown_until: Option<i64>,
+}
+
+impl SessionSnapshot {
+    /// 冷却还剩多少秒（0 表示可以提交）。
+    pub fn cooldown_remaining_secs(&self) -> i64 {
+        match self.cooldown_until {
+            Some(until) => ((until - now_ms()) / 1000).max(0),
+            None => 0,
+        }
+    }
 }
 
 #[durable_object]
@@ -69,7 +87,10 @@ impl DurableObject for AccountSession {
                     password: String,
                 }
                 let body: Body = req.json().await?;
-                self.do_login(&body.username, &body.password).await
+                match self.do_login(&body.username, &body.password).await {
+                    Ok(res) => Ok(res),
+                    Err(e) => Ok(self.json_error(&e.to_string(), "login")),
+                }
             }
             "/verify" => {
                 #[derive(Deserialize)]
@@ -79,7 +100,10 @@ impl DurableObject for AccountSession {
                     method: Option<String>,
                 }
                 let body: Body = req.json().await?;
-                self.do_verify(&body.code, body.method.as_deref()).await
+                match self.do_verify(&body.code, body.method.as_deref()).await {
+                    Ok(res) => Ok(res),
+                    Err(e) => Ok(self.json_error(&e.to_string(), "verify")),
+                }
             }
             "/logout" => {
                 let storage = self.state.storage();
@@ -107,8 +131,20 @@ impl DurableObject for AccountSession {
 
     /// alarm 承担两件事：给 DO 续期（避免 15 分钟窗口到期被驱逐），
     /// 以及检测 pipeline 是否僵死并重连。
+    ///
+    /// 关键：**没有已认证的会话就不要再排下一次 alarm**。
+    /// 否则一旦走到过 2FA 那一步（即使最后放弃或失败），alarm 链会自己永续，
+    /// 每 2 分钟白调一次 VRChat API，永不停止。
+    /// 待验证状态（pending cookie）存在 storage 里，不会因为停止 alarm 而丢。
     async fn alarm(&self) -> Result<Response> {
         let storage = self.state.storage();
+
+        let has_session = storage.get::<String>(K_COOKIE).await?.is_some();
+        if !has_session {
+            console_log!("没有已认证会话，停止 alarm 链（避免空跑 API）");
+            let _ = storage.delete_alarm().await;
+            return Response::empty();
+        }
 
         let last = storage.get::<i64>(K_LAST_EVENT).await?;
         let stale = match last {
@@ -116,8 +152,7 @@ impl DurableObject for AccountSession {
             None => true,
         };
 
-        let has_cookie = storage.get::<String>(K_COOKIE).await?.is_some();
-        if stale && has_cookie {
+        if stale {
             console_log!("pipeline 疑似僵死，重建连接");
             self.spawn_pipeline();
         }
@@ -139,16 +174,41 @@ impl AccountSession {
 
         let outcome = match client.login(username, password).await {
             Ok(o) => o,
-            Err(e) => {
-                self.set_error(&e.to_string()).await?;
-                return Response::error(format!("登录失败: {e}"), 502);
+            Err(LoginFailure::RateLimited { retry_after_secs, message }) => {
+                self.set_error(&message).await?;
+                self.state
+                    .storage()
+                    .put(K_COOLDOWN_UNTIL, now_ms() + retry_after_secs as i64 * 1000)
+                    .await?;
+                return Response::from_json(&serde_json::json!({
+                    "error": message,
+                    "stage": "login",
+                    "rate_limited": true,
+                    "retry_after_secs": retry_after_secs,
+                }))
+                .map(|r| r.with_status(429));
+            }
+            Err(LoginFailure::Other(msg)) => {
+                self.set_error(&msg).await?;
+                // 返回 400 + JSON 而不是 500：错误文本要能原样显示到网页上，
+                // 500 会丢掉可读信息，用户只能看到"Uncaught Error"。
+                return Response::from_json(&serde_json::json!({
+                    "error": msg,
+                    "stage": "login",
+                }))
+                .map(|r| r.with_status(400));
             }
         };
 
         match outcome {
             LoginOutcome::Need2fa { cookie, methods } => {
-                // 2FA 未完成：先把 cookie 暂存，等 /verify
+                // 2FA 未完成：暂存 cookie，并**记住登录时声明的验证方式**。
+                // VRChat 用 `emailOtp` 和 `totp` 区分两个不同的端点，
+                // 一律走 TOTP 会让邮箱验证码账号必然失败。
                 self.state.storage().put(K_PENDING, &cookie).await?;
+                self.state.storage().put(K_2FA_METHODS, &methods).await?;
+                // 新的一次登录尝试：清掉上一次遗留的限流冷却
+                let _ = self.state.storage().delete(K_COOLDOWN_UNTIL).await;
                 Response::from_json(&serde_json::json!({
                     "ok": false,
                     "need2fa": true,
@@ -181,29 +241,72 @@ impl AccountSession {
     }
 
     async fn do_verify(&self, code: &str, method: Option<&str>) -> Result<Response> {
-        let pending = self
-            .state
-            .storage()
+        let storage = self.state.storage();
+        let pending = storage
             .get::<String>(K_PENDING)
             .await?
             .ok_or_else(|| Error::RustError("没有待验证的登录，请重新提交账号密码".into()))?;
 
+        // 决定走哪个端点：显式指定 > 登录时 VRChat 声明的方式 > TOTP
+        let declared: Vec<String> = storage.get(K_2FA_METHODS).await?.unwrap_or_default();
+        let use_email = match method {
+            Some("email") => true,
+            Some("totp") => false,
+            _ => declared.iter().any(|m| m.eq_ignore_ascii_case("emailOtp")),
+        };
+
         let ua = self.user_agent()?;
         let mut client = VrcClient::with_cookie(ua, pending);
 
-        let cookie = if method == Some("email") {
-            client.verify_email_otp(code).await?
+        let cookie = match if use_email {
+            client.verify_email_otp(code).await
         } else {
-            client.verify_totp(code).await?
+            client.verify_totp(code).await
+        } {
+            Ok(c) => c,
+            // 验证码错了：待验证会话仍然有效，允许直接重试
+            Err(VerifyFailure::WrongCode(msg)) => {
+                return Ok(Response::from_json(&serde_json::json!({
+                    "error": msg,
+                    "stage": "verify",
+                    "retryable": true,
+                }))
+                .map(|r| r.with_status(400))?);
+            }
+            // 被限流：必须让前端停手，否则每次点击都会续期限流窗口
+            Err(VerifyFailure::RateLimited { retry_after_secs, message }) => {
+                let _ = storage.put(K_COOLDOWN_UNTIL, now_ms() + retry_after_secs as i64 * 1000).await;
+                return Ok(Response::from_json(&serde_json::json!({
+                    "error": message,
+                    "stage": "verify",
+                    "rate_limited": true,
+                    "retry_after_secs": retry_after_secs,
+                }))
+                .map(|r| r.with_status(429))?);
+            }
+            Err(VerifyFailure::SessionExpired(msg)) => {
+                let _ = storage.delete(K_PENDING).await;
+                let _ = storage.delete(K_2FA_METHODS).await;
+                return Ok(Response::from_json(&serde_json::json!({
+                    "error": msg,
+                    "stage": "verify",
+                    "needs_relogin": true,
+                }))
+                .map(|r| r.with_status(400))?);
+            }
+            Err(VerifyFailure::Other(msg)) => {
+                return Ok(self.json_error(&msg, "verify"));
+            }
         };
 
         let user = client.get_current_user().await?;
         let db = self.env.d1("DB")?;
 
-        let storage = self.state.storage();
         storage.put(K_COOKIE, &cookie).await?;
         storage.put(K_USER_ID, &user.user.id).await?;
         let _ = storage.delete(K_PENDING).await;
+        let _ = storage.delete(K_2FA_METHODS).await;
+        let _ = storage.delete(K_COOLDOWN_UNTIL).await;
         self.clear_error().await?;
 
         store::upsert_account(&db, &user).await?;
@@ -223,7 +326,7 @@ impl AccountSession {
 
     // ------------------------------------------------------------ pipeline
 
-    /// 起一个后台 pipeline 循环。
+    /// 起一个后台 pipeline 循环。没有已认证会话时直接返回，不发任何请求。
     ///
     /// 只捕获 owned 值（`Env` 可克隆，状态句柄用 `JsValue` 表示），
     /// 这样 future 是 `'static` 的，不需要 `self` 的生命周期参与。
@@ -234,6 +337,11 @@ impl AccountSession {
         let raw_state: JsValue = JsValue::from(self.state.as_raw());
 
         wasm_bindgen_futures::spawn_local(async move {
+            // run_pipeline 自己会再查一次 cookie；这里多一层保险，
+            // 确保未登录时连一次 VRChat 请求都不发。
+            if read_credentials(&raw_state).await.is_none() {
+                return;
+            }
             if let Err(e) = run_pipeline(env, raw_state).await {
                 console_error!("pipeline 退出: {e}");
             }
@@ -264,12 +372,18 @@ impl AccountSession {
 
     async fn snapshot(&self) -> Result<SessionSnapshot> {
         let storage = self.state.storage();
+        let pending = storage.get::<String>(K_PENDING).await?;
         Ok(SessionSnapshot {
             user_id: storage.get(K_USER_ID).await?,
             has_cookie: storage.get::<String>(K_COOKIE).await?.is_some(),
             last_event_at: storage.get(K_LAST_EVENT).await?,
             last_error: storage.get(K_LAST_ERROR).await?,
             reconnect_count: storage.get(K_RECONNECTS).await?.unwrap_or(0),
+            awaiting_2fa: pending.is_some(),
+            cooldown_until: storage.get(K_COOLDOWN_UNTIL).await?.filter(|until| {
+                // 过期的冷却记录顺手清掉，避免前端永远看到倒计时
+                *until > now_ms()
+            }),
         })
     }
 
@@ -287,6 +401,18 @@ impl AccountSession {
         Ok(())
     }
 
+    /// 把错误转成 400 + JSON，保证错误文本能完整传到网页上。
+    fn json_error(&self, message: &str, stage: &str) -> Response {
+        Response::from_json(&serde_json::json!({
+            "error": message,
+            "stage": stage,
+        }))
+        .map(|r| r.with_status(400))
+        .unwrap_or_else(|_| {
+            Response::error("内部错误", 500).unwrap_or_else(|_| unreachable!())
+        })
+    }
+
     fn user_agent(&self) -> Result<String> {
         Ok(self
             .env
@@ -296,6 +422,9 @@ impl AccountSession {
     }
 
     /// 全量刷新好友列表。
+    ///
+    /// 只在存在**已认证** cookie 时才发请求。pending cookie 不算 ——
+    /// 那只是 2FA 的中间态，拿它去调 API 只会白白浪费额度、加重限流。
     async fn refresh_friends(&self) -> Result<usize> {
         let storage = self.state.storage();
         let (Some(cookie), Some(uid)) = (

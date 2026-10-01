@@ -15,7 +15,7 @@ command = "cargo install -q \"worker-build@^0.8\" && worker-build --release --pa
 [[d1_databases]]
 binding = "DB"
 database_name = "vrc-utilities"
-database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+database_id = "a9af4ba4-f6aa-45d0-a79f-f93c7101a4f5"
 migrations_dir = "schema"
 
 # ---------------------------------------------------------------------------
@@ -39,7 +39,10 @@ new_sqlite_classes = ["AccountSession"]
 crons = ["*/2 * * * *"]
 
 [vars]
-# 看板访问令牌。生产环境建议改用 `wrangler secret put DASHBOARD_TOKEN`。
+# 看板访问令牌**不要**写在这里：wrangler.toml 会进版本库，明文令牌等于公开。
+# 正确做法：
+#   npx wrangler secret put DASHBOARD_TOKEN
+# 保持 CHANGE_ME 时系统会跳过鉴权并打警告。
 DASHBOARD_TOKEN = "CHANGE_ME"
 # VRChat 要求的 User-Agent，务必带上真实联系方式，方便对方在异常时联系你。
 VRCHAT_USER_AGENT = "VRCUtilities/0.1 (personal use)"

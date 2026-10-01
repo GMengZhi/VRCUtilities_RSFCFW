@@ -5,6 +5,7 @@
 'use strict';
 
 const POLL_MS = 3000;
+const IDLE_POLL_MS = 10000;   // 未登录 / 等验证码 / 限流冷却时的轮询间隔
 const TOKEN_KEY = 'vru_token';
 
 const el = (id) => document.getElementById(id);
@@ -13,6 +14,7 @@ const onlyLocation = el('only-location');
 
 let sinceId = 0;               // 事件增量游标
 let sessionState = 'offline';
+let currentSessionId = null;   // 服务端确认已登录时的账号 ID
 
 /* ------------------------------------------------------------------ */
 /* 令牌 */
@@ -100,6 +102,7 @@ const lastLocation = new Map();
 /* ------------------------------------------------------------------ */
 function renderSession(s) {
   sessionState = s.pipeline_state;
+  currentSessionId = s.account_id || s.id || s.user_id || null;
   const dot = el('conn-dot');
   dot.className = 'dot ' + s.pipeline_state;
   const map = {
@@ -241,6 +244,53 @@ const otpForm = el('otp-form');
 const loginMsg = el('login-msg');
 
 let lastUsername = '';
+let cooldownTimer = null;
+let cooldownUntil = 0;
+
+/* 限流倒计时：禁用提交按钮，到点自动恢复。
+   这是必须的 —— VRChat 的验证码端点限流很紧，限流期间反复点提交
+   会让冷却窗口不断续期，用户永远出不来。 */
+function startCooldown(seconds, reason) {
+  const submit = otpForm.querySelector('button[type="submit"]');
+  const codeInput = el('otp-code');
+  cooldownUntil = Date.now() + seconds * 1000;
+
+  if (cooldownTimer) clearInterval(cooldownTimer);
+
+  const render = () => {
+    const left = Math.ceil((cooldownUntil - Date.now()) / 1000);
+    if (left <= 0) {
+      clearInterval(cooldownTimer);
+      cooldownTimer = null;
+      submit.disabled = false;
+      codeInput.disabled = false;
+      submit.textContent = '提交验证码';
+      loginMsg.textContent = '可以重新尝试了。' + (reason || '');
+      return;
+    }
+    submit.disabled = true;
+    codeInput.disabled = true;
+    submit.textContent = `请等待 ${left} 秒`;
+    const mm = String(Math.floor(left / 60)).padStart(2, '0');
+    const ss = String(left % 60).padStart(2, '0');
+    loginMsg.textContent =
+      `被 VRChat 限流（429）。这是提交过频触发的，冷却期间请勿重复提交，` +
+      `剩余 ${mm}:${ss}。${reason || ''}`;
+  };
+
+  render();
+  cooldownTimer = setInterval(render, 1000);
+}
+
+function clearCooldown() {
+  if (cooldownTimer) clearInterval(cooldownTimer);
+  cooldownTimer = null;
+  cooldownUntil = 0;
+  const submit = otpForm.querySelector('button[type="submit"]');
+  const codeInput = el('otp-code');
+  if (submit) { submit.disabled = false; submit.textContent = '提交验证码'; }
+  if (codeInput) codeInput.disabled = false;
+}
 
 function showLogin(needLogin, awaiting2fa, username) {
   loginPanel.hidden = !(needLogin || awaiting2fa);
@@ -254,7 +304,7 @@ function showLogin(needLogin, awaiting2fa, username) {
     lastUsername = username;
     if (awaiting2fa) el('login-username').value = username;
   }
-  if (awaiting2fa) el('otp-code').focus();
+  if (awaiting2fa && !cooldownTimer) el('otp-code').focus();
 }
 
 async function post(path, payload) {
@@ -267,9 +317,19 @@ async function post(path, payload) {
     body: JSON.stringify(payload),
   });
   let data = {};
-  try { data = await res.json(); } catch { /* 空响应体 */ }
+  try { data = await res.json(); } catch { /* 空响应体或非 JSON */ }
   if (res.status === 401) throw new Error('令牌无效或未设置，请先在右上角填入看板访问令牌');
-  if (!res.ok || data.error) throw new Error(data.error || ('HTTP ' + res.status));
+  if (data.error) {
+    // 把结构化标记原样挂到 error 上，调用方据此决定下一步动作
+    const err = new Error(data.error);
+    err.needsRelogin = !!data.needs_relogin
+      || /重新提交账号密码|没有待验证的登录/.test(data.error);
+    err.rateLimited = !!data.rate_limited;
+    err.retryAfterSecs = data.retry_after_secs || 0;
+    err.retryable = !!data.retryable;
+    throw err;
+  }
+  if (!res.ok) throw new Error('HTTP ' + res.status);
   return data;
 }
 
@@ -283,6 +343,7 @@ loginForm.addEventListener('submit', async (e) => {
       password: el('login-password').value,
     });
     el('login-password').value = '';
+    clearCooldown();
     if (data.need2fa) {
       const methods = (data.methods || []).join(', ') || 'totp';
       loginMsg.textContent = '需要两步验证（' + methods + '），请输入验证码。';
@@ -293,12 +354,17 @@ loginForm.addEventListener('submit', async (e) => {
       tick();
     }
   } catch (err) {
+    if (err.rateLimited) {
+      startCooldown(err.retryAfterSecs || 300, '');
+      return;
+    }
     loginMsg.textContent = '登录失败：' + err.message;
   }
 });
 
 otpForm.addEventListener('submit', async (e) => {
   e.preventDefault();
+  if (cooldownTimer) return;  // 冷却期间直接忽略（按钮也已被禁用）
   loginMsg.textContent = '正在校验验证码…';
   try {
     const data = await post('/api/verify', {
@@ -306,11 +372,24 @@ otpForm.addEventListener('submit', async (e) => {
       code: el('otp-code').value.trim(),
     });
     el('otp-code').value = '';
+    clearCooldown();
     loginMsg.textContent = '验证成功，已同步 ' + (data.friends ?? 0) + ' 位好友。';
     showLogin(false, false);
     tick();
   } catch (err) {
+    if (err.rateLimited) {
+      el('otp-code').value = '';
+      startCooldown(err.retryAfterSecs || 300, '');
+      return;
+    }
     loginMsg.textContent = '验证失败：' + err.message;
+    if (err.needsRelogin) {
+      // 待验证会话已失效，回到账号密码步骤；否则用户会卡在永远失败的验证码表单上
+      el('otp-code').value = '';
+      clearCooldown();
+      showLogin(true, false);
+      loginMsg.textContent = '验证失败：' + err.message + ' 请重新输入账号密码。';
+    }
   }
 });
 
@@ -324,20 +403,43 @@ function isLocationEvent(t) {
 
 async function tick() {
   try {
-    const q = new URLSearchParams({ since_id: String(sinceId), limit: '100' });
-    const [session, events, friends, pending] = await Promise.all([
+    // 第一步只问"谁登录了"和"要不要输验证码"。
+    // 未登录时绝不请求 friends / events —— 那些数据本来就不存在，
+    // 请求它们只会制造无意义的流量，也会让你误以为后台在空跑。
+    const [session, pending] = await Promise.all([
       api('/api/session'),
-      api('/api/events?' + q),
-      api('/api/friends'),
-      api('/api/pending').catch(() => ({ awaiting_2fa: false })),
+      api('/api/pending').catch(() => ({ awaiting_2fa: false, cooldown_secs: 0 })),
     ]);
 
+    const loggedIn = !!(session.account_id || session.id || session.user_id);
     renderSession(session);
-    renderFriends(friends);
 
     // 没有账号就显示登录表单；有账号但 cookie 还没建立则停在验证码那一步
-    const needLogin = !session.account_id && !session.id && !session.user_id;
-    showLogin(needLogin, !!pending.awaiting_2fa, pending.username);
+    showLogin(!loggedIn, !!pending.awaiting_2fa, pending.username);
+
+    // 刷新页面后恢复限流倒计时（冷却状态存在服务端）
+    if (pending.cooldown_secs > 0 && !cooldownTimer) {
+      startCooldown(pending.cooldown_secs, '');
+    }
+
+    if (!loggedIn) {
+      // 保持列表为空态，不触发任何数据请求
+      if (sinceId === 0) {
+        renderEvents([]);
+        renderFriends([]);
+      }
+      setFoot('未登录 — 已暂停数据请求');
+      return;
+    }
+
+    // 只有确认已登录才拉取实际数据
+    const q = new URLSearchParams({ since_id: String(sinceId), limit: '100' });
+    const [events, friends] = await Promise.all([
+      api('/api/events?' + q),
+      api('/api/friends'),
+    ]);
+
+    renderFriends(friends.friends || []);
 
     let list = events.events || [];
     if (onlyLocation.checked) list = list.filter((e) => isLocationEvent(e.type));
@@ -362,25 +464,51 @@ async function tick() {
   }
 }
 
+/* 轮询循环。
+ *
+ * 用自排程的 setTimeout 而不是 setInterval，因为要让间隔**随状态变化**：
+ *   · 已登录   → 3 秒（实时性优先）
+ *   · 未登录 / 等验证码 / 限流冷却 → 放慢到 10 秒
+ * 这三种情况下数据不会变，高频轮询纯属浪费。 */
+let tickTimer = null;
+let tickFailures = 0;
+
+async function loop() {
+  const fast = !!currentSessionId && !cooldownTimer;
+  try {
+    await tick();
+    tickFailures = 0;
+  } catch {
+    // tick 内部已处理；这里只累计失败次数用于退避
+    tickFailures = Math.min(tickFailures + 1, 5);
+  }
+  const delay = (fast ? POLL_MS : IDLE_POLL_MS) * (tickFailures ? 2 : 1);
+  tickTimer = setTimeout(loop, delay);
+}
+
 /* ------------------------------------------------------------------ */
 /* 启动 */
 /* ------------------------------------------------------------------ */
 tokenInput.value = '';
 el('save-token').addEventListener('click', () => {
   setToken(tokenInput.value.trim());
-  sinceId = 0;
-  el('events').replaceChildren();
-  tick();
+  resetViews();
 });
 tokenInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') el('save-token').click();
 });
-el('refresh').addEventListener('click', tick);
+el('refresh').addEventListener('click', () => {
+  resetViews();
+});
 onlyLocation.addEventListener('change', () => {
-  sinceId = 0;
-  el('events').replaceChildren();
-  tick();
+  resetViews();
 });
 
-tick();
-setInterval(tick, POLL_MS);
+function resetViews() {
+  sinceId = 0;
+  el('events').replaceChildren();
+  if (tickTimer) clearTimeout(tickTimer);
+  tickTimer = setTimeout(loop, 0);
+}
+
+loop();

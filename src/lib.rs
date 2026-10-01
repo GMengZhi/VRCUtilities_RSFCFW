@@ -37,25 +37,39 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     router.run(req, env).await
 }
 
+/// 用指定 MIME 类型返回字节内容。
+///
+/// 踩过的坑：`ResponseBuilder::ok()` 会**强制**把 Content-Type 设成
+/// `text/plain; charset=utf-8`，`from_bytes()` 则强制设成
+/// `application/octet-stream`，两者都在链式调用之后执行、会覆盖先前设的值。
+/// 结果就是 HTML 被浏览器当纯文本显示。
+/// 唯一可靠的时机是在**已经构造好的 `Response`** 上改 `headers_mut()`。
+fn serve_bytes(mime: &str, body: &'static str) -> Result<Response> {
+    let bytes = body.as_bytes().to_vec();
+    let mut res = Response::builder().from_bytes(bytes)?;
+    res.headers_mut().set("Content-Type", mime)?;
+    // 文本资源不需要 octet-stream 那套推断，明确禁用嗅探
+    res.headers_mut().set("X-Content-Type-Options", "nosniff")?;
+    Ok(res)
+}
+
 async fn serve_index(_req: Request, _ctx: RouteContext<()>) -> Result<Response> {
-    Response::builder()
-        .with_header("Content-Type", "text/html; charset=utf-8")?
-        .ok(INDEX_HTML)
+    // from_html 内部会正确设置 text/html; charset=utf-8
+    Response::builder().from_html(INDEX_HTML)
 }
 
 async fn serve_css(_req: Request, _ctx: RouteContext<()>) -> Result<Response> {
-    Response::builder()
-        .with_header("Content-Type", "text/css; charset=utf-8")?
-        .ok(APP_CSS)
+    serve_bytes("text/css; charset=utf-8", APP_CSS)
 }
 
 async fn serve_js(_req: Request, _ctx: RouteContext<()>) -> Result<Response> {
-    Response::builder()
-        .with_header("Content-Type", "application/javascript; charset=utf-8")?
-        .ok(APP_JS)
+    serve_bytes("application/javascript; charset=utf-8", APP_JS)
 }
 
 /// cron：pipeline 断线期间靠它把好友快照补齐。
+///
+/// 只对**已完成认证**的账号触发。DO 侧也会再确认一次有没有已认证 cookie，
+/// 所以未登录 / 半登录状态的账号不会被空跑 API。
 #[event(scheduled)]
 async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     if let Err(e) = run_scheduled(&env).await {
@@ -65,6 +79,7 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
 
 async fn run_scheduled(env: &Env) -> Result<()> {
     let db = env.d1("DB")?;
+    // 只取已经成功登录过的账号（accounts 行只在认证成功后才写入）
     let ids: Vec<String> = db
         .prepare("SELECT id FROM accounts")
         .all()
@@ -74,12 +89,15 @@ async fn run_scheduled(env: &Env) -> Result<()> {
         .filter_map(|v| v.get("id").and_then(|x| x.as_str()).map(String::from))
         .collect();
 
+    if ids.is_empty() {
+        console_log!("cron：没有已登录的账号，跳过");
+        return Ok(());
+    }
+
     for id in ids {
         if let Ok(stub) = account_stub(env, &id) {
-            // 顺带触发一次 alarm 重排，等价于给 DO 续期
-            let _ = stub
-                .fetch_with_str(&format!("https://do/poll-friends"))
-                .await;
+            // 走 DO 的 /poll-friends：DO 内部会检查已认证 cookie 再决定是否调 API
+            let _ = stub.fetch_with_str("https://do/poll-friends").await;
         }
     }
     Ok(())
@@ -230,46 +248,48 @@ async fn api_session(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     Response::from_json(&payload)
 }
 
-/// 2FA 是否处于待验证状态。前端据此决定要不要弹验证码输入框。
-async fn pending_login_info(env: &Env) -> Result<Option<serde_json::Value>> {
-    let Some(username) = latest_login_name(env).await? else {
-        return Ok(None);
-    };
-    let do_name = normalize_account_name(&username);
-    let Ok(stub) = account_stub(env, &do_name) else {
-        return Ok(None);
-    };
-    let Ok(mut res) = stub.fetch_with_str("https://do/status").await else {
-        return Ok(None);
-    };
-    let Ok(text) = res.text().await else {
-        return Ok(None);
-    };
-    let Ok(snap) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return Ok(None);
-    };
-
-    // has_cookie=false 且存在 pending 才算"等待验证码"
-    let awaiting = snap
-        .get("has_cookie")
-        .and_then(|v| v.as_bool())
-        .map(|has| !has)
-        .unwrap_or(false);
-
-    Ok(Some(serde_json::json!({
-        "awaiting_2fa": awaiting,
-        "username": username,
-    })))
-}
-
+/// 2FA 待验证状态与限流冷却。
+///
+/// 这两项只存在于 DO 存储里，D1 不存，所以只能问 DO 一次。
 async fn api_pending(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     if let Some(res) = require_auth(&req, &ctx.env) {
         return Ok(res);
     }
-    match pending_login_info(&ctx.env).await? {
-        Some(v) => Response::from_json(&v),
-        None => Response::from_json(&serde_json::json!({ "awaiting_2fa": false })),
-    }
+
+    let username = latest_login_name(&ctx.env).await?;
+    let Some(username) = username else {
+        return Response::from_json(&serde_json::json!({
+            "awaiting_2fa": false,
+            "cooldown_secs": 0,
+        }));
+    };
+
+    let snap = fetch_snapshot(&ctx.env, &username).await;
+    let awaiting = snap
+        .as_ref()
+        .and_then(|v| v.get("awaiting_2fa"))
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    let cooldown = snap
+        .as_ref()
+        .and_then(|v| v.get("cooldown_until"))
+        .and_then(|x| x.as_i64())
+        .map(|until| ((until - crate::db::now_ms()) / 1000).max(0))
+        .unwrap_or(0);
+
+    Response::from_json(&serde_json::json!({
+        "awaiting_2fa": awaiting,
+        "cooldown_secs": cooldown,
+        "username": username,
+    }))
+}
+
+/// 读 DO 的 `/status` 快照（失败返回 None）。
+async fn fetch_snapshot(env: &Env, do_name: &str) -> Option<serde_json::Value> {
+    let stub = account_stub(env, &normalize_account_name(do_name)).ok()?;
+    let mut res = stub.fetch_with_str("https://do/status").await.ok()?;
+    let text = res.text().await.ok()?;
+    serde_json::from_str(&text).ok()
 }
 
 async fn api_friends(req: Request, ctx: RouteContext<()>) -> Result<Response> {
