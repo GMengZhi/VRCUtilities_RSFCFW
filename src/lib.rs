@@ -198,18 +198,46 @@ async fn api_session(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         return Ok(res);
     }
 
+    // 最近一次尝试登录的用户名。2FA 和限流状态都在这个账号的 DO 里，
+    // 所以即使用户还没登录成功，也要靠它定位到对应的 DO。
+    //
+    // 注意：这一行在一次失败的登录尝试后会**永久留存**。所以下面用它去问 DO
+    // 之前必须先确认真的还有"未完成的登录"，否则未登录状态下每 10 秒就会
+    // 白唤醒一次 DO。
+    let pending_username = latest_login_name(&ctx.env).await?;
+
     let Some(account_id) = current_account_id(&ctx.env).await? else {
-        return Response::from_json(&serde_json::json!({
+        // 从未登录成功过。要把 2FA / 冷却状态报出去，
+        // 否则"提交了密码、正在等验证码"这个中间态前端就看不到。
+        //
+        // 但**不能无条件问 DO**：D1 里的 pending_login 在一次失败的登录尝试后
+        // 会永久留存，无条件问就等于未登录状态下每 10 秒白唤醒一次 DO。
+        // 所以先低成本探一下"到底有没有未完成的登录"，探到了就连快照一起带回来，
+        // 不再重复请求。
+        let snap = match &pending_username {
+            Some(u) => pending_snapshot(&ctx.env, u).await,
+            None => None,
+        };
+        let has_pending = snap.is_some();
+
+        let payload = serde_json::json!({
             "account_id": null,
-            "pipeline_state": "offline",
             "display_name": null,
             "status": null,
+            "status_description": null,
             "location": null,
+            "pipeline_state": "offline",
             "last_event_at": null,
-            "reconnect_count": 0,
+            "last_connect_at": null,
             "last_error": null,
-            "hint": "尚未登录，请 POST /api/login 提交 VRChat 账号",
-        }));
+            "reconnect_count": 0,
+            "hint": if has_pending {
+                "已有待验证会话，请输入验证码"
+            } else {
+                "尚未登录，请提交 VRChat 账号密码"
+            },
+        });
+        return Response::from_json(&session_payload(payload, pending_username, snap.as_ref()));
     };
 
     let db = ctx.env.d1("DB")?;
@@ -224,33 +252,55 @@ async fn api_session(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         .await?;
 
     // DO 里的实时状态比 D1 新（事件写库有节流），能拿到就以它为准
-    let snapshot = account_stub(&ctx.env, &account_id)
-        .ok()
-        .map(|stub| async move { stub.fetch_with_str("https://do/status").await });
-
+    let snap = fetch_snapshot(&ctx.env, &account_id).await;
     let mut payload = row.unwrap_or(serde_json::json!({ "id": account_id }));
-    if let Some(fut) = snapshot {
-        if let Ok(mut res) = fut.await {
-            if let Ok(text) = res.text().await {
-                if let Ok(snap) = serde_json::from_str::<serde_json::Value>(&text) {
-                    payload["last_event_at"] =
-                        snap.get("last_event_at").cloned().unwrap_or(serde_json::Value::Null);
-                    payload["last_error"] =
-                        snap.get("last_error").cloned().unwrap_or(serde_json::Value::Null);
-                    if let Some(rc) = snap.get("reconnect_count") {
-                        payload["reconnect_count"] = rc.clone();
-                    }
-                }
+
+    if let Some(snap) = &snap {
+        for (dst, src) in [
+            ("last_event_at", "last_event_at"),
+            ("last_error", "last_error"),
+            ("reconnect_count", "reconnect_count"),
+        ] {
+            if let Some(v) = snap.get(src) {
+                payload[dst] = v.clone();
             }
         }
     }
 
-    Response::from_json(&payload)
+    Response::from_json(&session_payload(payload, pending_username, snap.as_ref()))
+}
+
+/// 组装 `/api/session` 的响应。
+///
+/// 2FA 待验证状态和限流冷却只存在于 DO 快照里，而这个接口本来就要取快照，
+/// 所以顺手一起返回 —— 这样前端只需要一个轮询请求，而不是两个各打一次 DO。
+fn session_payload(
+    mut payload: serde_json::Value,
+    pending_username: Option<String>,
+    snap: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let awaiting = snap
+        .and_then(|v| v.get("awaiting_2fa"))
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    let cooldown = snap
+        .and_then(|v| v.get("cooldown_until"))
+        .and_then(|x| x.as_i64())
+        .map(|until| ((until - crate::db::now_ms()) / 1000).max(0))
+        .unwrap_or(0);
+
+    payload["awaiting_2fa"] = serde_json::json!(awaiting);
+    payload["cooldown_secs"] = serde_json::json!(cooldown);
+    if let Some(u) = pending_username {
+        payload["pending_username"] = serde_json::json!(u);
+    }
+    payload
 }
 
 /// 2FA 待验证状态与限流冷却。
 ///
-/// 这两项只存在于 DO 存储里，D1 不存，所以只能问 DO 一次。
+/// 保留这个接口是为了让"只想知道要不要输验证码"的调用方（比如脚本）能少拉数据。
+/// 网页看板不用它 —— 那些信息已经并进 `/api/session`，避免两次 DO 往返。
 async fn api_pending(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     if let Some(res) = require_auth(&req, &ctx.env) {
         return Ok(res);
@@ -264,7 +314,8 @@ async fn api_pending(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         }));
     };
 
-    let snap = fetch_snapshot(&ctx.env, &username).await;
+    // 和 /api/session 用同一套判断，避免在无事可做时白唤醒 DO
+    let snap = pending_snapshot(&ctx.env, &username).await;
     let awaiting = snap
         .as_ref()
         .and_then(|v| v.get("awaiting_2fa"))
@@ -290,6 +341,65 @@ async fn fetch_snapshot(env: &Env, do_name: &str) -> Option<serde_json::Value> {
     let mut res = stub.fetch_with_str("https://do/status").await.ok()?;
     let text = res.text().await.ok()?;
     serde_json::from_str(&text).ok()
+}
+
+/// 这个账号的 DO 里到底有没有"未完成的登录"。
+///
+/// 判断依据是 DO 存储里是否存在 pending cookie（正在等验证码）或尚未过期的
+/// 限流冷却，或者已经有已认证 cookie。
+///
+/// 返回 `Some(快照)` 表示"有未完成状态，快照已经在手上"，调用方不必再问一次 DO；
+/// 返回 `None` 表示确实什么都没有 —— 此时未登录状态下就完全不需要唤醒 DO，
+/// 这正是"页面开着但没登录"时省掉每 10 秒一次无谓请求的关键。
+async fn pending_snapshot(env: &Env, do_name: &str) -> Option<serde_json::Value> {
+    let snap = fetch_snapshot(env, do_name).await?;
+    let awaiting = snap
+        .get("awaiting_2fa")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let cooling = snap
+        .get("cooldown_until")
+        .and_then(|v| v.as_i64())
+        .map(|until| until > crate::db::now_ms())
+        .unwrap_or(false);
+    let has_cookie = snap
+        .get("has_cookie")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if should_query_do(awaiting, cooling, has_cookie) {
+        Some(snap)
+    } else {
+        None
+    }
+}
+
+/// 未登录状态下，是否还需要为了状态去唤醒 DO。
+///
+/// 抽成纯函数是因为这里是个容易写错、又不容易察觉的**成本开关**：
+/// 判断错成 `true` 就是每 10 秒一次无谓的 DO 唤醒（页面开着挂一整天），
+/// 判断错成 `false` 则验证码界面和限流倒计时会失灵。
+fn should_query_do(awaiting_2fa: bool, cooling: bool, has_cookie: bool) -> bool {
+    awaiting_2fa || cooling || has_cookie
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_query_do;
+
+    #[test]
+    fn queries_do_only_when_there_is_something_to_report() {
+        // 正在等验证码 → 必须问，否则验证码界面看不到
+        assert!(should_query_do(true, false, false));
+        // 限流冷却中 → 必须问，否则倒计时会消失
+        assert!(should_query_do(false, true, false));
+        // 已有已认证 cookie（只是 D1 还没写上）→ 必须问，否则看不到 pipeline 状态
+        assert!(should_query_do(false, false, true));
+
+        // 什么都没有 → 不问。
+        // 这一条是成本护栏：判断错了就是页面挂一天、每 10 秒一次无谓的 DO 唤醒。
+        assert!(!should_query_do(false, false, false));
+    }
 }
 
 async fn api_friends(req: Request, ctx: RouteContext<()>) -> Result<Response> {

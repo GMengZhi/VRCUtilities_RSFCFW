@@ -37,6 +37,13 @@ const K_PENDING: &str = "pending_cookie";
 const K_2FA_METHODS: &str = "twofa_methods";
 /// 被限流后的冷却截止时间（毫秒）。存在这里，刷新页面也能看到剩余等待时间。
 const K_COOLDOWN_UNTIL: &str = "cooldown_until";
+/// 待验证会话的建立时间（毫秒）。
+///
+/// VRChat 的 pending 会话本身会过期，但如果用户直接关掉页面不再回来，
+/// 这个标志就会永远留着，导致云端每 10 秒白唤醒一次 DO。所以这里自己记时间，
+/// 超过 `PENDING_TTL_MS` 就当作已失效，主动清理。
+const K_PENDING_AT: &str = "pending_at";
+const PENDING_TTL_MS: i64 = 15 * 60 * 1000;
 const K_USER_ID: &str = "user_id";
 const K_LAST_EVENT: &str = "last_event_at";
 const K_LAST_ERROR: &str = "last_error";
@@ -109,6 +116,10 @@ impl DurableObject for AccountSession {
                 let storage = self.state.storage();
                 let _ = storage.delete(K_COOKIE).await;
                 let _ = storage.delete(K_PENDING).await;
+                let _ = storage.delete(K_2FA_METHODS).await;
+                let _ = storage.delete(K_PENDING_AT).await;
+                let _ = storage.delete(K_COOLDOWN_UNTIL).await;
+                // 没有会话了，alarm 链没有存在的意义
                 let _ = storage.delete_alarm().await;
                 Response::from_json(&serde_json::json!({ "ok": true }))
             }
@@ -207,6 +218,8 @@ impl AccountSession {
                 // 一律走 TOTP 会让邮箱验证码账号必然失败。
                 self.state.storage().put(K_PENDING, &cookie).await?;
                 self.state.storage().put(K_2FA_METHODS, &methods).await?;
+                // 记下建立时间，超时后会被自动清理
+                self.state.storage().put(K_PENDING_AT, now_ms()).await?;
                 // 新的一次登录尝试：清掉上一次遗留的限流冷却
                 let _ = self.state.storage().delete(K_COOLDOWN_UNTIL).await;
                 Response::from_json(&serde_json::json!({
@@ -287,6 +300,7 @@ impl AccountSession {
             Err(VerifyFailure::SessionExpired(msg)) => {
                 let _ = storage.delete(K_PENDING).await;
                 let _ = storage.delete(K_2FA_METHODS).await;
+                let _ = storage.delete(K_PENDING_AT).await;
                 return Ok(Response::from_json(&serde_json::json!({
                     "error": msg,
                     "stage": "verify",
@@ -306,6 +320,7 @@ impl AccountSession {
         storage.put(K_USER_ID, &user.user.id).await?;
         let _ = storage.delete(K_PENDING).await;
         let _ = storage.delete(K_2FA_METHODS).await;
+        let _ = storage.delete(K_PENDING_AT).await;
         let _ = storage.delete(K_COOLDOWN_UNTIL).await;
         self.clear_error().await?;
 
@@ -372,7 +387,26 @@ impl AccountSession {
 
     async fn snapshot(&self) -> Result<SessionSnapshot> {
         let storage = self.state.storage();
-        let pending = storage.get::<String>(K_PENDING).await?;
+
+        // 待验证会话超时就直接清理掉，避免它永远挂在那里让云端反复唤醒 DO。
+        // 用户真回来了也只是需要重新输一次账号密码，代价有限。
+        let mut pending = storage.get::<String>(K_PENDING).await?;
+        if pending.is_some() {
+            let started = storage.get::<i64>(K_PENDING_AT).await?;
+            let expired = match started {
+                Some(t) => now_ms() - t > PENDING_TTL_MS,
+                // 老数据没有时间戳，按未过期处理，避免误清
+                None => false,
+            };
+            if expired {
+                console_log!("待验证会话已超时，清理");
+                let _ = storage.delete(K_PENDING).await;
+                let _ = storage.delete(K_2FA_METHODS).await;
+                let _ = storage.delete(K_PENDING_AT).await;
+                pending = None;
+            }
+        }
+
         Ok(SessionSnapshot {
             user_id: storage.get(K_USER_ID).await?,
             has_cookie: storage.get::<String>(K_COOKIE).await?.is_some(),
@@ -380,10 +414,10 @@ impl AccountSession {
             last_error: storage.get(K_LAST_ERROR).await?,
             reconnect_count: storage.get(K_RECONNECTS).await?.unwrap_or(0),
             awaiting_2fa: pending.is_some(),
-            cooldown_until: storage.get(K_COOLDOWN_UNTIL).await?.filter(|until| {
-                // 过期的冷却记录顺手清掉，避免前端永远看到倒计时
-                *until > now_ms()
-            }),
+            cooldown_until: storage
+                .get(K_COOLDOWN_UNTIL)
+                .await?
+                .filter(|until| *until > now_ms()),
         })
     }
 

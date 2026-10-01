@@ -239,11 +239,41 @@ if !has_session {
 
 `spawn_pipeline()` 也加了一层同样的保险，未登录时连一次请求都不发。
 
-**前端：未登录时不再请求 friends / events。**
-轮询改成两步：先只问 `/api/session` 和 `/api/pending` 确认登录状态，
-确认已登录才去拉好友和事件。未登录时列表保持空态，页脚显示"未登录 — 已暂停数据请求"。
+**前端：未登录时不再请求 friends / events，且只用一个请求问状态。**
+早先轮询会同时打 `/api/session` 和 `/api/pending`，而两者都要读 DO 快照——
+同一份数据取了两遍。现在 2FA 待验证标志和限流冷却并进了 `/api/session`：
 
-顺带把固定 `setInterval` 换成了自排程 `setTimeout`，间隔随状态变化：
+```json
+{
+  "account_id": null, "pipeline_state": "offline",
+  "awaiting_2fa": true, "cooldown_secs": 0,
+  "pending_username": "you@example.com",
+  "hint": "尚未登录，请提交 VRChat 账号密码"
+}
+```
+
+前端先只问这一个接口，确认 `account_id` 存在才去拉好友和事件。
+未登录时列表保持空态，页脚显示"未登录 — 已暂停数据请求"。
+`/api/pending` 仍然保留，给"只想知道要不要输验证码"的脚本用。
+
+**未登录且无事可做时，连 DO 都不会被唤醒。** 这点需要额外一层判断：
+D1 里的 `pending_login`（最近一次登录尝试的用户名）在一次**失败**的登录尝试后
+会永久留存，如果拿它无条件去问 DO，页面挂着不登录就是每 10 秒白唤醒一次 DO。
+所以先用一条廉价查询确认"真的还有未完成的登录"——只有这三种情况才需要问：
+
+| 情况 | 为什么必须问 |
+|---|---|
+| 正在等验证码（`awaiting_2fa`） | 否则验证码输入框不显示 |
+| 限流冷却未过（`cooldown_until`） | 否则倒计时消失，用户会盲目重试 |
+| 已存在认证 cookie | 否则看不到 pipeline 健康度 |
+
+三者都没有 → 完全不碰 DO。这个判断抽成了纯函数 `should_query_do` 并有单元测试，
+因为它判错的代价是隐性的：错成 `true` 是页面挂一天、持续无谓唤醒。
+
+另外给待验证会话加了 **15 分钟 TTL**：用户直接关页面不再回来的话，
+`pending` 标志会被自动清理，不会永远挂着让云端反复唤醒 DO。
+
+固定 `setInterval` 也换成了自排程 `setTimeout`，间隔随状态变化：
 
 | 状态 | 轮询间隔 |
 |---|---|
