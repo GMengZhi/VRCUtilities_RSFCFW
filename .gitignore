@@ -1,0 +1,15 @@
+target
+node_modules
+
+# worker-build / wrangler 产物
+build/
+.dryrun/
+wrangler.toml.bak
+*.log
+
+### Wrangler ###
+.wrangler/
+.env*
+!.env.example
+.dev.vars*
+!.dev.vars.example

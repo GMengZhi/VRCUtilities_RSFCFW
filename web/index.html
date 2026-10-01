@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VRC Utilities · 云端监控看板</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="dot" id="conn-dot"></span>
+    <strong>VRC Utilities</strong>
+    <span class="muted" id="conn-text">未连接</span>
+  </div>
+  <div class="actions">
+    <input id="token" type="password" placeholder="看板访问令牌" autocomplete="off">
+    <button id="save-token">保存</button>
+    <button id="refresh">刷新</button>
+  </div>
+</header>
+
+<!-- 登录卡：账号密码 → 2FA 验证码 -->
+<section class="panel login" id="login-panel" hidden>
+  <h2 id="login-title">登录 VRChat 账号</h2>
+
+  <form class="login-form" id="login-form">
+    <label>账号（邮箱）
+      <input id="login-username" type="text" autocomplete="username" required>
+    </label>
+    <label>密码
+      <input id="login-password" type="password" autocomplete="current-password" required>
+    </label>
+    <button type="submit">登录并开始监控</button>
+  </form>
+
+  <form class="login-form" id="otp-form" hidden>
+    <label>两步验证码
+      <input id="otp-code" type="text" inputmode="numeric" autocomplete="one-time-code" required>
+    </label>
+    <button type="submit">提交验证码</button>
+  </form>
+
+  <p class="muted" id="login-msg"></p>
+  <p class="muted small">
+    凭据只在提交的那一次经过本服务，之后仅保存 VRChat 下发的会话 cookie。
+    注意：会话与登录出口 IP 绑定，云端登录会挤掉本机 VRCX 的登录。
+  </p>
+</section>
+
+<!-- 顶部状态卡：账号自身状态 + pipeline 健康度 -->
+<section class="cards" id="account-cards"></section>
+
+<main class="grid">
+  <section class="panel">
+    <h2>实时动态 <span class="muted" id="events-count"></span></h2>
+    <label class="filter">
+      <input type="checkbox" id="only-location"> 只看位置变化
+    </label>
+    <ul class="events" id="events">
+      <li class="empty">等待数据…</li>
+    </ul>
+  </section>
+
+  <section class="panel">
+    <h2>好友在线 <span class="muted" id="friends-count"></span></h2>
+    <ul class="friends" id="friends">
+      <li class="empty">等待数据…</li>
+    </ul>
+  </section>
+</main>
+
+<footer class="footer">
+  <span class="muted" id="foot-status"></span>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>

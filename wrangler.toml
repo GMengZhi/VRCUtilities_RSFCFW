@@ -1,0 +1,45 @@
+name = "vrc-utilities"
+main = "build/index.js"
+compatibility_date = "2026-09-30"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+[build]
+command = "cargo install -q \"worker-build@^0.8\" && worker-build --release --panic-unwind"
+
+# ---------------------------------------------------------------------------
+# D1：冷数据（事件流 / 好友快照 / 维度表）
+# 建库后把返回的 database_id 填进来，再执行：
+#   wrangler d1 migrations apply vrc-utilities --remote
+# ---------------------------------------------------------------------------
+[[d1_databases]]
+binding = "DB"
+database_name = "vrc-utilities"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+migrations_dir = "schema"
+
+# ---------------------------------------------------------------------------
+# Durable Object：每个 VRChat 账号一个实例，持有 pipeline 长连接
+# 注意：出站 WebSocket 不支持 hibernation，必须靠 alarm 心跳续期，
+#       否则 DO 会在 70~140 秒无事件后被驱逐。
+# ---------------------------------------------------------------------------
+[[durable_objects.bindings]]
+name = "ACCOUNT"
+class_name = "AccountSession"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["AccountSession"]
+
+# ---------------------------------------------------------------------------
+# 兜底轮询：pipeline 断线期间仍能靠它保持好友快照不落后太多。
+# 账号列表从 D1 的 accounts 表读，这里不需要额外配置。
+# ---------------------------------------------------------------------------
+[triggers]
+crons = ["*/2 * * * *"]
+
+[vars]
+# 看板访问令牌。生产环境建议改用 `wrangler secret put DASHBOARD_TOKEN`。
+DASHBOARD_TOKEN = "CHANGE_ME"
+# VRChat 要求的 User-Agent，务必带上真实联系方式，方便对方在异常时联系你。
+VRCHAT_USER_AGENT = "VRCUtilities/0.1 (personal use)"
